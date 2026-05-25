@@ -387,6 +387,8 @@ DIGITALOCEAN_URL=https://inference.do-ai.run
 DIGITALOCEAN_MODEL=anthropic-claude-4.5-sonnet
 ```
 
+Make sure this is a real `.env` file in the project root. The app loads it on startup.
+
 Load with:
 ```python
 from dotenv import load_dotenv

@@ -13,7 +13,7 @@ pip install -r requirements.txt
 ### 2. Start the API Server
 
 ```bash
-python api.py
+python app.py
 ```
 
 You should see:
@@ -26,7 +26,7 @@ INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 In another terminal, run the test script:
 
 ```bash
-python test_api.py
+python app.py
 ```
 
 This will run one end-to-end test and show the generated proposal summary.
@@ -225,7 +225,7 @@ The API returns:
 - Make sure Python 3.11+ is installed
 - If you're on Python 3.13, recreate the virtual environment after updating dependencies
 - Verify all dependencies: `pip install -r requirements.txt`
-- Try a different port: `uvicorn api:app --port 8001`
+- Try a different port: `API_PORT=8001 python app.py`
 
 ### Pydantic build error on Windows
 - If you see a `pydantic-core` build failure on Python 3.13, you are likely using an old cached environment or stale dependency pin
@@ -234,7 +234,7 @@ The API returns:
 
 ### Import errors
 - Ensure you're in the correct directory
-- Check that `pricing_engine.py` and `proposal_builder.py` are in the same folder
+- Check that `app.py` is in the project root
 
 ### Request fails
 - Check that the JSON format matches the example
@@ -244,7 +244,7 @@ The API returns:
 ### Port already in use
 - List processes: `lsof -i :8000` (macOS/Linux)
 - Kill process: `kill -9 <PID>`
-- Or use a different port: `python api.py --port 8001`
+- Or use a different port: `API_PORT=8001 python app.py`
 
 ---
 
