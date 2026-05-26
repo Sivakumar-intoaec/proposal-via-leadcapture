@@ -27,6 +27,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
@@ -230,26 +231,6 @@ def PTBL(
         return str(cell or default)
 
     table_content: List[List[Dict[str, Any]]] = []
-
-    table_content.append([
-        {
-            "value": header_value(0, "Name"),
-            "style": {"width": 60, "height": 60},
-        },
-        {
-            "value": header_value(1, "Price"),
-            "style": {"width": 60, "height": 60},
-        },
-        {
-            "value": header_value(2, "Quantity"),
-            "style": {"width": 60, "height": 60},
-        },
-        {
-            "value": header_value(3, "Subtotal"),
-            "style": {"width": 60, "height": 60},
-        },
-    ])
-
     for row_name, row_price, row_qty in rows:
         table_content.append([
             {
@@ -269,7 +250,7 @@ def PTBL(
     return {
         "controllerId": uid(),
         "controllerName": "PRICING_TABLE",
-        "content": table_content[1:],
+        "content": table_content,
         "header": [
             {"value": "Name", "label": "Name"},
             {"value": "Price", "label": "Price"},
@@ -349,6 +330,22 @@ def parse_services(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [s for s in services if isinstance(s, dict) and s.get("isActive", True)]
 
 
+def collect_priced_fields(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    priced_fields: List[Dict[str, Any]] = []
+
+    for field in form_data.get("fields") or []:
+        if isinstance(field, dict):
+            priced_fields.append({"serviceName": "General", "field": field})
+
+    for service in parse_services(form_data):
+        service_name = str(service.get("serviceName") or "Service")
+        for field in service.get("fields") or []:
+            if isinstance(field, dict):
+                priced_fields.append({"serviceName": service_name, "field": field})
+
+    return priced_fields
+
+
 def lookup_response_value(form_data: Dict[str, Any], field_name: str) -> Any:
     responses = form_data.get("responses") or form_data.get("answers") or {}
     if not isinstance(responses, dict):
@@ -417,54 +414,6 @@ def infer_quantity_from_field(field: Dict[str, Any], response_value: Any = None,
     return default
 
 
-def extract_items(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    for service in parse_services(form_data):
-        service_name = service.get("serviceName", "Service")
-        for field in service.get("fields", []) or []:
-            options = field.get("options") or []
-            if not options:
-                continue
-
-            field_type = field.get("type", "")
-            label = field.get("description", field.get("fieldName", "Item"))
-            if field_type == "multiselect":
-                price = sum(float(opt.get("price", 0)) for opt in options)
-                item_label = f"{label} (Multi-service)"
-            else:
-                price = sum(float(opt.get("price", 0)) for opt in options) / len(options)
-                item_label = label
-
-            pricing_rule = "fixed_unit"
-            quantity = 1.0
-            label_blob = f"{field.get('fieldName', '')} {label} {field.get('description', '')}".lower()
-            if any(token in label_blob for token in ["sqft", "sq ft", "square feet", "square foot", "area", "built-up", "built up", "size"]):
-                pricing_rule = "area_based"
-                quantity = derive_quantity_from_option_label(options[0].get("label", ""), default=1.0)
-                if quantity <= 0:
-                    quantity = 1.0
-
-            subtotal = float(price) * float(quantity)
-            summary = (
-                f"Configured pricing rule '{pricing_rule}' applied to {item_label}; "
-                f"unit price {price:.2f}, quantity {quantity:g}, subtotal {subtotal:.2f}."
-            )
-
-            items.append(
-                {
-                    "itemName": item_label,
-                    "category": service_name,
-                    "unitPrice": float(price),
-                    "quantity": float(quantity),
-                    "subtotal": float(subtotal),
-                    "pricingRule": pricing_rule,
-                    "summary": summary,
-                    "justification": f"Configured pricing rule for {field.get('fieldName', 'selected field')}",
-                }
-            )
-    return items
-
-
 def derive_quantity_from_option_label(option_label: str, default: float = 1.0) -> float:
     text = str(option_label or "").lower()
     numbers = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*\.?\d*", text)]
@@ -482,54 +431,79 @@ def derive_quantity_from_option_label(option_label: str, default: float = 1.0) -
 
 def extract_items(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-    for service in parse_services(form_data):
-        service_name = service.get("serviceName", "Service")
-        for field in service.get("fields", []) or []:
-            price_matrix = field.get("priceMatrix") or {}
-            if not isinstance(price_matrix, dict) or not price_matrix.get("enabled"):
-                continue
+    for priced in collect_priced_fields(form_data):
+        service_name = priced["serviceName"]
+        field = priced["field"]
 
-            entries = price_matrix.get("entries") or []
-            if not entries:
-                continue
+        price_matrix = field.get("priceMatrix") or {}
+        if not isinstance(price_matrix, dict) or not price_matrix.get("enabled"):
+            continue
 
-            field_type = str(field.get("type", "")).lower()
-            label = field.get("description", field.get("fieldName", "Item"))
-            response_value = lookup_response_value(form_data, field.get("fieldName", ""))
-            selected_index = 0
-            if isinstance(response_value, dict) and "optionIndex" in response_value:
-                selected_index = normalize_option_index(response_value.get("optionIndex"))
-            elif isinstance(response_value, (int, float)) and field_type in {"dropdown", "radio", "multiselect"}:
-                selected_index = normalize_option_index(response_value)
+        entries = price_matrix.get("entries") or []
+        if not entries:
+            continue
 
-            if field_type == "multiselect":
-                pricing_rule = "additive_selection"
-                unit_price = sum(extract_price_from_matrix(field, idx) for idx in range(len(entries)))
-                quantity = 1.0
-            else:
-                pricing_rule = "per_unit_measure" if field_type == "number" and str(field.get("unitType") or "").lower() in {"dimension", "quantity"} else "selected_option"
-                unit_price = extract_price_from_matrix(field, selected_index)
-                quantity = infer_quantity_from_field(field, response_value=response_value, default=1.0)
+        field_type = str(field.get("type", "")).lower()
+        options = field.get("options") or []
+        response_value = lookup_response_value(form_data, field.get("fieldName", ""))
 
-            subtotal = float(unit_price) * float(quantity)
-            item_label = label
-            summary = (
-                f"Configured pricing rule '{pricing_rule}' applied to {item_label}; "
-                f"unit price {unit_price:.2f}, quantity {quantity:g}, subtotal {subtotal:.2f}."
-            )
+        selected_index = 0
+        if isinstance(response_value, dict) and "optionIndex" in response_value:
+            selected_index = normalize_option_index(response_value.get("optionIndex"))
+        elif isinstance(response_value, (int, float)) and field_type in {"dropdown", "radio"}:
+            selected_index = normalize_option_index(response_value)
+        elif isinstance(response_value, str) and options:
+            lowered = response_value.strip().lower()
+            for idx, option in enumerate(options):
+                if lowered == str(option.get("label", "")).strip().lower():
+                    selected_index = idx
+                    break
 
-            items.append(
-                {
-                    "itemName": item_label,
-                    "category": service_name,
-                    "unitPrice": float(unit_price),
-                    "quantity": float(quantity),
-                    "subtotal": float(subtotal),
-                    "pricingRule": pricing_rule,
-                    "summary": summary,
-                    "justification": f"Configured pricing rule for {field.get('fieldName', 'selected field')}",
-                }
-            )
+        if field_type in {"multiselect", "checkbox"}:
+            pricing_rule = "additive_selection"
+            selected_indices: List[int] = []
+            if isinstance(response_value, list):
+                if response_value and isinstance(response_value[0], (int, float)):
+                    selected_indices = [normalize_option_index(v) for v in response_value]
+                else:
+                    option_lookup = {str(opt.get("label", "")).strip().lower(): i for i, opt in enumerate(options)}
+                    selected_indices = [
+                        option_lookup.get(str(v).strip().lower(), -1)
+                        for v in response_value
+                    ]
+                    selected_indices = [i for i in selected_indices if i >= 0]
+            if not selected_indices:
+                selected_indices = [0]
+            unit_price = sum(extract_price_from_matrix(field, idx) for idx in selected_indices)
+            quantity = 1.0
+        else:
+            unit_price = extract_price_from_matrix(field, selected_index)
+            quantity = infer_quantity_from_field(field, response_value=response_value, default=1.0)
+            pricing_rule = "per_unit_measure" if field_type == "number" else "selected_option"
+
+        if quantity <= 0:
+            quantity = 1.0
+
+        subtotal = float(unit_price) * float(quantity)
+        display_name = str(field.get("fieldName") or field.get("description") or "Item").strip()
+        item_label = display_name if service_name == "General" else f"{service_name}: {display_name}"
+        summary = (
+            f"Configured pricing rule '{pricing_rule}' applied to {item_label}; "
+            f"unit price {unit_price:.2f}, quantity {quantity:g}, subtotal {subtotal:.2f}."
+        )
+
+        items.append(
+            {
+                "itemName": item_label,
+                "category": service_name,
+                "unitPrice": float(unit_price),
+                "quantity": float(quantity),
+                "subtotal": float(subtotal),
+                "pricingRule": pricing_rule,
+                "summary": summary,
+                "justification": f"Configured pricing rule for {field.get('fieldName', 'selected field')}",
+            }
+        )
     return items
 
 
@@ -591,6 +565,7 @@ PRICING_AI_KEYS = [
     "pricing_summary_note",
     "justification_title",
     "justification_sections",
+    "line_item_notes",
 ]
 
 
@@ -599,14 +574,20 @@ def fallback_pricing_ai_content(form_data: Dict[str, Any], pricing_table: Dict[s
     subtotal = money(pricing_table["summary"]["subtotal"], currency_code)
     contingency = money(pricing_table["summary"]["contingency"], currency_code)
     total = money(pricing_table["summary"]["total"], currency_code)
+    line_items = pricing_table.get("lineItemSummaries") or []
     return {
-        "pricing_intro": f"Transparent pricing has been structured for {city} using the selected scope and service complexity.",
-        "pricing_summary_note": f"Subtotal {subtotal}, contingency reserve {contingency}, and total {total} are derived from the submitted service selections.",
+        "pricing_intro": f"The pricing below has been tailored for {city} and reflects the selected scope, complexity, and delivery effort.",
+        "pricing_summary_note": f"Subtotal {subtotal}, contingency reserve {contingency}, and total {total} are derived from the submitted service selections and pricing rules.",
         "justification_title": "Investment Breakdown & Value Framework",
         "justification_sections": [
             f"The subtotal of {subtotal} reflects the selected services and the effort needed to deliver the scope for {city}.",
             f"A contingency reserve of {contingency} protects against changes in scope, coordination, and site conditions.",
             f"The total investment of {total} includes the subtotal plus contingency, keeping the proposal financially clear and traceable.",
+        ],
+        "line_item_notes": [
+            f"{item['itemName']}: {item['summary']}" for item in line_items
+        ] or [
+            "Line-item pricing follows the configured pricing rules in the submitted form.",
         ],
     }
 
@@ -619,11 +600,11 @@ def normalize_pricing_ai_content(ai_content: Any, form_data: Dict[str, Any], pri
     normalized: Dict[str, Any] = {}
     for key in PRICING_AI_KEYS:
         value = ai_content.get(key, fallback.get(key))
-        if key == "justification_sections":
+        if key in {"justification_sections", "line_item_notes"}:
             if not isinstance(value, list):
-                value = fallback["justification_sections"]
+                value = fallback[key]
             sections = [str(section).strip() for section in value if str(section).strip()]
-            normalized[key] = sections or fallback["justification_sections"]
+            normalized[key] = sections or fallback[key]
         else:
             normalized[key] = str(value).strip() if value is not None else str(fallback.get(key, "")).strip()
     return normalized
@@ -653,6 +634,7 @@ def validate_pricing_ai_content_locally(ai_content: Dict[str, Any], form_data: D
 
     section_blob = " ".join(str(section) for section in sections).lower()
     intro_blob = f"{normalized.get('pricing_intro', '')} {normalized.get('pricing_summary_note', '')}".lower()
+    line_item_blob = " ".join(str(item) for item in (normalized.get("line_item_notes") or [])).lower()
 
     if "subtotal" not in section_blob and "subtotal" not in intro_blob:
         issues.append("Pricing content should mention subtotal.")
@@ -662,6 +644,10 @@ def validate_pricing_ai_content_locally(ai_content: Dict[str, Any], form_data: D
         issues.append("Pricing content should mention total.")
     if city and city.lower() not in section_blob and city.lower() not in intro_blob:
         issues.append("Pricing content should mention project location.")
+    if pricing_table.get("lineItemSummaries") and len(normalized.get("line_item_notes") or []) < 1:
+        issues.append("Pricing content should include at least one line-item note.")
+    if "pricing rule" not in line_item_blob and "subtotal" not in line_item_blob and pricing_table.get("lineItemSummaries"):
+        issues.append("Pricing content should explain the configured pricing rule for the line items.")
 
     approved = not issues
     corrected_content = normalized if approved else fallback
@@ -683,6 +669,7 @@ def validate_pricing_ai_content_locally(ai_content: Dict[str, Any], form_data: D
                 "Contingency reserve",
                 "Total amount",
                 "Location context" if city else "Location context not provided",
+                "Configured pricing rule" if pricing_table.get("lineItemSummaries") else "No line items",
             ],
             "unsupported_points": [],
         },
@@ -712,15 +699,25 @@ def call_digitalocean_pricing_ai(form_data: Dict[str, Any], pricing_table: Dict[
         "pricingSummary": pricing_table.get("summary", {}),
         "pricingItems": pricing_table.get("lineItemSummaries", []),
         "pricingJustifications": pricing_table.get("justifications", {}),
+        "pricingNarrativeRules": [
+            "Write in a polished, architectural proposal tone.",
+            "Explain why each major cost exists, not just what it is.",
+            "Reference subtotal, contingency, and total explicitly.",
+            "If line-item notes are available, keep them short and specific.",
+            "Avoid generic filler such as 'this reflects the scope'.",
+        ],
     }
 
     prompt = f"""
 Return ONLY valid JSON with these keys:
-pricing_intro, pricing_summary_note, justification_title, justification_sections
+pricing_intro, pricing_summary_note, justification_title, justification_sections, line_item_notes
 
 This content is for the pricing page and pricing justification only.
 It must explain the pricing summary using the provided subtotal, contingency, and total.
 Do not change any numeric amounts.
+Do not write generic marketing copy. Make it specific, grounded, and proposal-ready.
+Each justification section should be 1-3 sentences long.
+Each line item note should be 1 sentence and should explain the configured pricing rule or business reason.
 
 Context:
 {json.dumps(prompt_payload, ensure_ascii=True)}
@@ -1220,6 +1217,7 @@ def build_pricing_page(form_data: Dict[str, Any], ai: Dict[str, Any], pricing_ta
 def build_justification_page(ai: Dict[str, Any]) -> Dict[str, Any]:
     page = page_base("Pricing Justification")
     sections = ai.get("justification_sections") or []
+    line_item_notes = ai.get("line_item_notes") or []
     controllers: List[Dict[str, Any]] = [
         make_shape_controller(0, 0, 792, 1120, "rgba(255,255,255,1)"),
         make_shape_controller(0, 0, 792, 6, "rgba(192,154,77,1)"),
@@ -1253,6 +1251,25 @@ def build_justification_page(ai: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
         current_y += approx_height + 24
+
+    if line_item_notes:
+        controllers.append(make_text_controller(48, current_y + 12, "696px", [heading_block("Line Item Rationale", "h3", 16, "#0F172A")]))
+        current_y += 56
+        for note in line_item_notes:
+            note_text = str(note).strip()
+            if not note_text:
+                continue
+            lines = math.ceil(len(note_text) / 88)
+            approx_height = max(24, lines * 20)
+            controllers.append(
+                make_text_controller(
+                    48,
+                    current_y,
+                    "696px",
+                    [text_block(note_text, 12, "#4B5563")],
+                )
+            )
+            current_y += approx_height + 16
 
     controllers.append(make_shape_controller(0, 1112, 792, 8, "rgba(192,154,77,1)"))
     page["controllers"] = controllers
@@ -1291,52 +1308,131 @@ def build_proposal(form_data: Dict[str, Any], ai: Dict[str, Any], pricing_table:
     }
 
 
+def build_full_proposal_response(form_data: Dict[str, Any], currency_code: str) -> Dict[str, Any]:
+    pricing_table = build_pricing_table(form_data, currency_code)
+    pricing_ai_content = call_digitalocean_pricing_ai(form_data, pricing_table, currency_code)
+    pricing_judge_report = call_digitalocean_pricing_judge(form_data, pricing_table, pricing_ai_content, currency_code)
+    proposal_ai_content = call_digitalocean_ai(form_data, pricing_table, currency_code)
+    pricing_ai_merged = normalize_pricing_ai_content(
+        pricing_judge_report.get("corrected_content") or pricing_ai_content,
+        form_data,
+        pricing_table,
+        currency_code,
+    )
+    ai_content = {**proposal_ai_content, **pricing_ai_merged}
+    judge_report = call_digitalocean_judge(form_data, pricing_table, ai_content, currency_code)
+    validated_ai_content = normalize_ai_content(
+        judge_report.get("corrected_content") or ai_content,
+        form_data,
+        pricing_table,
+        currency_code,
+    )
+
+    result = build_proposal(form_data, validated_ai_content, pricing_table, currency_code)
+    result["pricingTable"] = pricing_table
+    result["lineItemSummaries"] = pricing_table.get("lineItemSummaries", [])
+    result["justificationText"] = build_justification_text(pricing_table)
+    result["pricingValidation"] = {
+        "approved": pricing_judge_report.get("approved", False),
+        "score": pricing_judge_report.get("score", 0),
+        "mode": pricing_judge_report.get("mode", "local-pricing-judge"),
+        "response_validation": pricing_judge_report.get("response_validation", {}),
+        "justification_validation": pricing_judge_report.get("justification_validation", {}),
+        "summary": pricing_judge_report.get("summary", ""),
+    }
+    result["validation"] = {
+        "approved": judge_report.get("approved", False),
+        "score": judge_report.get("score", 0),
+        "mode": judge_report.get("mode", "local-judge"),
+        "response_validation": judge_report.get("response_validation", {}),
+        "justification_validation": judge_report.get("justification_validation", {}),
+        "summary": judge_report.get("summary", ""),
+    }
+    return result
+
+
 @app.post("/api/v1/generate-proposal")
 async def generate_proposal(request: Request):
     try:
         payload = await request.json()
         form_data = normalize_payload(payload if isinstance(payload, dict) else {})
         currency_code = ((form_data.get("meta") or {}).get("currency") or "USD").upper()
+        return build_full_proposal_response(form_data, currency_code)
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error ({type(exc).__name__}): {str(exc)}")
 
-        pricing_table = build_pricing_table(form_data, currency_code)
-        pricing_ai_content = call_digitalocean_pricing_ai(form_data, pricing_table, currency_code)
-        pricing_judge_report = call_digitalocean_pricing_judge(form_data, pricing_table, pricing_ai_content, currency_code)
-        proposal_ai_content = call_digitalocean_ai(form_data, pricing_table, currency_code)
-        pricing_ai_merged = normalize_pricing_ai_content(
-            pricing_judge_report.get("corrected_content") or pricing_ai_content,
-            form_data,
-            pricing_table,
-            currency_code,
-        )
-        ai_content = {**proposal_ai_content, **pricing_ai_merged}
-        judge_report = call_digitalocean_judge(form_data, pricing_table, ai_content, currency_code)
-        validated_ai_content = normalize_ai_content(
-            judge_report.get("corrected_content") or ai_content,
-            form_data,
-            pricing_table,
-            currency_code,
-        )
-        result = build_proposal(form_data, validated_ai_content, pricing_table, currency_code)
-        result["pricingTable"] = pricing_table
-        result["lineItemSummaries"] = pricing_table.get("lineItemSummaries", [])
-        result["justificationText"] = build_justification_text(pricing_table)
-        result["pricingValidation"] = {
-            "approved": pricing_judge_report.get("approved", False),
-            "score": pricing_judge_report.get("score", 0),
-            "mode": pricing_judge_report.get("mode", "local-pricing-judge"),
-            "response_validation": pricing_judge_report.get("response_validation", {}),
-            "justification_validation": pricing_judge_report.get("justification_validation", {}),
-            "summary": pricing_judge_report.get("summary", ""),
-        }
-        result["validation"] = {
-            "approved": judge_report.get("approved", False),
-            "score": judge_report.get("score", 0),
-            "mode": judge_report.get("mode", "local-judge"),
-            "response_validation": judge_report.get("response_validation", {}),
-            "justification_validation": judge_report.get("justification_validation", {}),
-            "summary": judge_report.get("summary", ""),
-        }
-        return result
+
+@app.post("/api/v1/generate-proposal/stream")
+async def generate_proposal_stream(request: Request):
+    try:
+        payload = await request.json()
+        form_data = normalize_payload(payload if isinstance(payload, dict) else {})
+        currency_code = ((form_data.get("meta") or {}).get("currency") or "USD").upper()
+
+        def sse(event: str, data: Any) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
+
+        def iterator():
+            yield sse("start", {"status": "started", "currency": currency_code})
+            yield sse("stage", {"name": "pricing", "status": "running"})
+            pricing_table = build_pricing_table(form_data, currency_code)
+            yield sse("stage", {"name": "pricing", "status": "done", "summary": pricing_table.get("summary", {})})
+
+            yield sse("stage", {"name": "pricing_ai", "status": "running"})
+            pricing_ai_content = call_digitalocean_pricing_ai(form_data, pricing_table, currency_code)
+            yield sse("stage", {"name": "pricing_ai", "status": "done", "content": pricing_ai_content})
+
+            yield sse("stage", {"name": "pricing_judge", "status": "running"})
+            pricing_judge_report = call_digitalocean_pricing_judge(form_data, pricing_table, pricing_ai_content, currency_code)
+            yield sse("stage", {"name": "pricing_judge", "status": "done", "validation": pricing_judge_report})
+
+            yield sse("stage", {"name": "proposal_ai", "status": "running"})
+            proposal_ai_content = call_digitalocean_ai(form_data, pricing_table, currency_code)
+            yield sse("stage", {"name": "proposal_ai", "status": "done", "content": proposal_ai_content})
+
+            pricing_ai_merged = normalize_pricing_ai_content(
+                pricing_judge_report.get("corrected_content") or pricing_ai_content,
+                form_data,
+                pricing_table,
+                currency_code,
+            )
+            ai_content = {**proposal_ai_content, **pricing_ai_merged}
+
+            yield sse("stage", {"name": "judge", "status": "running"})
+            judge_report = call_digitalocean_judge(form_data, pricing_table, ai_content, currency_code)
+            yield sse("stage", {"name": "judge", "status": "done", "validation": judge_report})
+
+            validated_ai_content = normalize_ai_content(
+                judge_report.get("corrected_content") or ai_content,
+                form_data,
+                pricing_table,
+                currency_code,
+            )
+            result = build_proposal(form_data, validated_ai_content, pricing_table, currency_code)
+            result["pricingTable"] = pricing_table
+            result["lineItemSummaries"] = pricing_table.get("lineItemSummaries", [])
+            result["justificationText"] = build_justification_text(pricing_table)
+            result["pricingValidation"] = {
+                "approved": pricing_judge_report.get("approved", False),
+                "score": pricing_judge_report.get("score", 0),
+                "mode": pricing_judge_report.get("mode", "local-pricing-judge"),
+                "response_validation": pricing_judge_report.get("response_validation", {}),
+                "justification_validation": pricing_judge_report.get("justification_validation", {}),
+                "summary": pricing_judge_report.get("summary", ""),
+            }
+            result["validation"] = {
+                "approved": judge_report.get("approved", False),
+                "score": judge_report.get("score", 0),
+                "mode": judge_report.get("mode", "local-judge"),
+                "response_validation": judge_report.get("response_validation", {}),
+                "justification_validation": judge_report.get("justification_validation", {}),
+                "summary": judge_report.get("summary", ""),
+            }
+            yield sse("result", result)
+            yield sse("done", {"status": "completed"})
+
+        return StreamingResponse(iterator(), media_type="text/event-stream")
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal server error ({type(exc).__name__}): {str(exc)}")
