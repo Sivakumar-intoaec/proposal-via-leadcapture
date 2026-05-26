@@ -54,12 +54,30 @@ def now_ms() -> str:
 
 
 def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(payload.get("data"), dict) and payload.get("success") is True:
+        data = payload["data"]
+        return {
+            "formName": data.get("formName") or data.get("title") or "Proposal Form",
+            "title": data.get("title") or data.get("formName") or "Proposal Form",
+            "description": data.get("description") or "",
+            "fields": data.get("fields") or [],
+            "serviceTypes": data.get("serviceTypes") or [],
+            "meta": payload.get("meta") or data.get("meta") or {},
+            "responses": payload.get("responses") or data.get("responses") or {},
+            "success": True,
+        }
+
     if isinstance(payload.get("data"), dict):
         payload = {**payload["data"], "meta": payload.get("meta", payload["data"].get("meta"))}
+
     return {
-        "leadCapture": payload.get("leadCapture") or {},
-        "serviceTypes": payload.get("serviceTypes") or {},
+        "formName": payload.get("formName") or payload.get("title") or "Proposal Form",
+        "title": payload.get("title") or payload.get("formName") or "Proposal Form",
+        "description": payload.get("description") or "",
+        "fields": payload.get("fields") or payload.get("leadCapture", {}).get("fields") or [],
+        "serviceTypes": payload.get("serviceTypes") or [],
         "meta": payload.get("meta") or {},
+        "responses": payload.get("responses") or payload.get("answers") or {},
     }
 
 
@@ -280,8 +298,8 @@ def lead_value(form_data: Dict[str, Any], field_name: str, default: str = "") ->
 
 def build_macros(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     field_names = {
-        field.get("fieldName", "")
-        for field in form_data.get("leadCapture", {}).get("fields", [])
+        str(field.get("fieldName", "")).strip().lower()
+        for field in form_data.get("fields", [])
         if field.get("fieldName")
     }
     macros: List[Dict[str, Any]] = []
@@ -310,13 +328,13 @@ def build_macros(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
 
-    if "fullName" in field_names:
+    if any(name in field_names for name in ["fullname", "full name", "name"]):
         add("LEAD_NAME", "{LEAD_NAME}", "LEADS")
-    if "email" in field_names:
+    if any("email" in name for name in field_names):
         add("LEAD_EMAIL", "{LEAD_EMAIL}", "LEADS")
-    if "phone" in field_names:
+    if any("phone" in name for name in field_names):
         add("LEAD_PHONE_NUMBER", "{LEAD_PHONE_NUMBER}", "LEADS")
-    if "projectLocation" in field_names:
+    if any(name in field_names for name in ["projectlocation", "project location", "location", "city"]):
         add("LEAD_PROJECT_LOCATION", "{LEAD_PROJECT_LOCATION}", "LEADS")
 
     add("ORGANIZATION_NAME", "{ORGANIZATION_NAME}", "ORGANIZATION")
@@ -325,8 +343,78 @@ def build_macros(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def parse_services(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    services = form_data.get("serviceTypes", {}).get("fields", []) or []
-    return [s for s in services if s.get("isActive", True)]
+    services = form_data.get("serviceTypes", []) or []
+    if isinstance(services, dict):
+        services = services.get("fields", []) or []
+    return [s for s in services if isinstance(s, dict) and s.get("isActive", True)]
+
+
+def lookup_response_value(form_data: Dict[str, Any], field_name: str) -> Any:
+    responses = form_data.get("responses") or form_data.get("answers") or {}
+    if not isinstance(responses, dict):
+        return None
+
+    candidates = [field_name, field_name.lower(), field_name.replace(" ", "_"), field_name.replace(" ", "")]
+    for candidate in candidates:
+        if candidate in responses:
+            return responses[candidate]
+    return None
+
+
+def normalize_option_index(value: Any) -> int:
+    try:
+        idx = int(value)
+        return idx if idx >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_price_from_matrix(field: Dict[str, Any], option_index: int = 0) -> float:
+    price_matrix = field.get("priceMatrix") or {}
+    if not isinstance(price_matrix, dict) or not price_matrix.get("enabled"):
+        return 0.0
+
+    entries = price_matrix.get("entries") or []
+    if not entries:
+        return 0.0
+
+    idx = option_index if option_index < len(entries) else 0
+    entry = entries[idx] or {}
+    try:
+        return float(entry.get("value", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def derive_quantity_from_text(text: str, default: float = 1.0) -> float:
+    blob = str(text or "").lower()
+    numbers = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*\.?\d*", blob)]
+    if not numbers:
+        return default
+    if len(numbers) >= 2 and any(sep in blob for sep in ["-", " to ", "–", "—"]):
+        return (numbers[0] + numbers[1]) / 2.0
+    return numbers[0]
+
+
+def infer_quantity_from_field(field: Dict[str, Any], response_value: Any = None, default: float = 1.0) -> float:
+    field_type = str(field.get("type") or "").lower()
+    unit_type = str(field.get("unitType") or "").lower()
+
+    if response_value not in (None, ""):
+        if isinstance(response_value, (int, float)):
+            return float(response_value)
+        return derive_quantity_from_text(str(response_value), default=default)
+
+    if field_type == "number":
+        return derive_quantity_from_text(
+            f"{field.get('description', '')} {field.get('fieldName', '')}",
+            default=default,
+        )
+
+    if unit_type in {"dimension", "quantity"}:
+        return default
+
+    return default
 
 
 def extract_items(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -347,13 +435,99 @@ def extract_items(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 price = sum(float(opt.get("price", 0)) for opt in options) / len(options)
                 item_label = label
 
+            pricing_rule = "fixed_unit"
+            quantity = 1.0
+            label_blob = f"{field.get('fieldName', '')} {label} {field.get('description', '')}".lower()
+            if any(token in label_blob for token in ["sqft", "sq ft", "square feet", "square foot", "area", "built-up", "built up", "size"]):
+                pricing_rule = "area_based"
+                quantity = derive_quantity_from_option_label(options[0].get("label", ""), default=1.0)
+                if quantity <= 0:
+                    quantity = 1.0
+
+            subtotal = float(price) * float(quantity)
+            summary = (
+                f"Configured pricing rule '{pricing_rule}' applied to {item_label}; "
+                f"unit price {price:.2f}, quantity {quantity:g}, subtotal {subtotal:.2f}."
+            )
+
             items.append(
                 {
                     "itemName": item_label,
                     "category": service_name,
-                    "basePrice": float(price),
-                    "quantity": 1,
-                    "justification": f"Pricing based on {field.get('fieldName', 'selected field')}",
+                    "unitPrice": float(price),
+                    "quantity": float(quantity),
+                    "subtotal": float(subtotal),
+                    "pricingRule": pricing_rule,
+                    "summary": summary,
+                    "justification": f"Configured pricing rule for {field.get('fieldName', 'selected field')}",
+                }
+            )
+    return items
+
+
+def derive_quantity_from_option_label(option_label: str, default: float = 1.0) -> float:
+    text = str(option_label or "").lower()
+    numbers = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*\.?\d*", text)]
+    if not numbers:
+        return default
+
+    if "+" in text and numbers:
+        return numbers[0]
+
+    if len(numbers) >= 2 and any(sep in text for sep in ["-", " to ", "–", "—"]):
+        return (numbers[0] + numbers[1]) / 2.0
+
+    return numbers[0]
+
+
+def extract_items(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for service in parse_services(form_data):
+        service_name = service.get("serviceName", "Service")
+        for field in service.get("fields", []) or []:
+            price_matrix = field.get("priceMatrix") or {}
+            if not isinstance(price_matrix, dict) or not price_matrix.get("enabled"):
+                continue
+
+            entries = price_matrix.get("entries") or []
+            if not entries:
+                continue
+
+            field_type = str(field.get("type", "")).lower()
+            label = field.get("description", field.get("fieldName", "Item"))
+            response_value = lookup_response_value(form_data, field.get("fieldName", ""))
+            selected_index = 0
+            if isinstance(response_value, dict) and "optionIndex" in response_value:
+                selected_index = normalize_option_index(response_value.get("optionIndex"))
+            elif isinstance(response_value, (int, float)) and field_type in {"dropdown", "radio", "multiselect"}:
+                selected_index = normalize_option_index(response_value)
+
+            if field_type == "multiselect":
+                pricing_rule = "additive_selection"
+                unit_price = sum(extract_price_from_matrix(field, idx) for idx in range(len(entries)))
+                quantity = 1.0
+            else:
+                pricing_rule = "per_unit_measure" if field_type == "number" and str(field.get("unitType") or "").lower() in {"dimension", "quantity"} else "selected_option"
+                unit_price = extract_price_from_matrix(field, selected_index)
+                quantity = infer_quantity_from_field(field, response_value=response_value, default=1.0)
+
+            subtotal = float(unit_price) * float(quantity)
+            item_label = label
+            summary = (
+                f"Configured pricing rule '{pricing_rule}' applied to {item_label}; "
+                f"unit price {unit_price:.2f}, quantity {quantity:g}, subtotal {subtotal:.2f}."
+            )
+
+            items.append(
+                {
+                    "itemName": item_label,
+                    "category": service_name,
+                    "unitPrice": float(unit_price),
+                    "quantity": float(quantity),
+                    "subtotal": float(subtotal),
+                    "pricingRule": pricing_rule,
+                    "summary": summary,
+                    "justification": f"Configured pricing rule for {field.get('fieldName', 'selected field')}",
                 }
             )
     return items
@@ -362,7 +536,7 @@ def extract_items(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 def build_pricing_table(form_data: Dict[str, Any], currency_code: str) -> Dict[str, Any]:
     items = extract_items(form_data)
     items = items[:7]
-    subtotal = sum(item["basePrice"] * item["quantity"] for item in items)
+    subtotal = sum(item["subtotal"] for item in items)
     contingency = subtotal * 0.10
     total = subtotal + contingency
 
@@ -371,8 +545,8 @@ def build_pricing_table(form_data: Dict[str, Any], currency_code: str) -> Dict[s
         content.append(
             [
                 item["itemName"],
-                str(int(item["basePrice"])) if float(item["basePrice"]).is_integer() else f"{float(item['basePrice']):.2f}",
-                str(int(item["quantity"])),
+                str(int(item["unitPrice"])) if float(item["unitPrice"]).is_integer() else f"{float(item['unitPrice']):.2f}",
+                str(int(item["quantity"])) if float(item["quantity"]).is_integer() else f"{float(item['quantity']):.2f}",
             ]
         )
 
@@ -390,6 +564,18 @@ def build_pricing_table(form_data: Dict[str, Any], currency_code: str) -> Dict[s
             {"value": "Quantity", "label": "Quantity"},
         ],
         "content": content,
+        "items": items,
+        "lineItemSummaries": [
+            {
+                "itemName": item["itemName"],
+                "unitPrice": item["unitPrice"],
+                "quantity": item["quantity"],
+                "subtotal": item["subtotal"],
+                "summary": item["summary"],
+                "pricingRule": item["pricingRule"],
+            }
+            for item in items
+        ],
         "summary": {
             "subtotal": subtotal,
             "contingency": contingency,
@@ -524,7 +710,7 @@ def call_digitalocean_pricing_ai(form_data: Dict[str, Any], pricing_table: Dict[
         "currency": currency_code,
         "city": (form_data.get("meta") or {}).get("city", ""),
         "pricingSummary": pricing_table.get("summary", {}),
-        "pricingItems": pricing_table.get("content", []),
+        "pricingItems": pricing_table.get("lineItemSummaries", []),
         "pricingJustifications": pricing_table.get("justifications", {}),
     }
 
@@ -595,7 +781,7 @@ def call_digitalocean_pricing_judge(
         "currency": currency_code,
         "city": (form_data.get("meta") or {}).get("city", ""),
         "pricingSummary": pricing_table.get("summary", {}),
-        "pricingItems": pricing_table.get("content", []),
+        "pricingItems": pricing_table.get("lineItemSummaries", []),
         "candidate": pricing_ai_content,
     }
 
@@ -1132,6 +1318,7 @@ async def generate_proposal(request: Request):
         )
         result = build_proposal(form_data, validated_ai_content, pricing_table, currency_code)
         result["pricingTable"] = pricing_table
+        result["lineItemSummaries"] = pricing_table.get("lineItemSummaries", [])
         result["justificationText"] = build_justification_text(pricing_table)
         result["pricingValidation"] = {
             "approved": pricing_judge_report.get("approved", False),
