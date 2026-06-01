@@ -7,8 +7,8 @@ from fastapi.responses import StreamingResponse
 
 
 def register_routes(app, parse_raw_request_body, normalize_payload, build_proposal_stream_iterator):
-    @app.post("/api/v1/generate-proposal")
-    async def generate_proposal(request: Request):
+    @app.post("/api/v1/pricingtable-with-ai")
+    async def generate_pricing_table(request: Request):
         try:
             payload = parse_raw_request_body(await request.body())
             form_data = normalize_payload(payload)
@@ -36,8 +36,8 @@ def register_routes(app, parse_raw_request_body, normalize_payload, build_propos
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Internal server error ({type(exc).__name__}): {str(exc)}")
 
-    @app.post("/api/v1/generate-proposal/stream")
-    async def generate_proposal_stream(request: Request):
+    @app.post("/api/v1/pricingtable-with-ai/stream")
+    async def generate_pricing_table_stream(request: Request):
         try:
             payload = parse_raw_request_body(await request.body())
             form_data = normalize_payload(payload)
