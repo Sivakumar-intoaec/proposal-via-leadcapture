@@ -1,18 +1,4 @@
 """
-Single-file Lead Capture to Proposal API
-========================================
-One endpoint:
-  POST /api/v1/generate-proposal
-
-Returns:
-  - pages
-  - macros
-
-The proposal content is generated with DigitalOcean AI when available.
-Pricing and page structure are built in this file only.
-"""
-
-"""
 IntoAEC AI Lead Capture Form Generator — FastAPI application.
 
 Set env vars (see .env.example), then run:
@@ -30,9 +16,16 @@ Example:
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
+import re
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List
+from uuid import uuid4
+
+import requests
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -45,6 +38,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 
 app = FastAPI(title="IntoAEC AI Lead Capture Form Generator", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 
 @app.exception_handler(RequestValidationError)
@@ -1819,11 +1813,13 @@ def call_digitalocean_ai(form_data: Dict[str, Any], pricing_table: Dict[str, Any
         or ""
     ).strip()
     if not api_key:
+        logger.warning("DigitalOcean API key not found; falling back to local proposal content.")
         return fallback_ai_content(form_data, pricing_table, currency_code)
 
     base_url = os.getenv("DIGITALOCEAN_URL", "https://inference.do-ai.run").rstrip("/")
     model_name = (form_data.get("meta") or {}).get("model") or os.getenv("DIGITALOCEAN_MODEL", "anthropic-claude-4.5-sonnet")
     endpoint = f"{base_url}/chat/completions" if base_url.endswith("/v1") else f"{base_url}/v1/chat/completions"
+    logger.debug("Calling DigitalOcean AI: endpoint=%s model=%s", endpoint, model_name)
 
     user_selections = extract_user_selections(form_data)
     items = extract_items(form_data)
@@ -1889,14 +1885,24 @@ Reference the client's actual selections and amounts in your writing.
             timeout=90,
         )
         if not response.ok:
+            logger.warning(
+                "DigitalOcean AI request failed: status=%s, body=%s",
+                response.status_code,
+                response.text[:1000],
+            )
             return fallback_ai_content(form_data, pricing_table, currency_code)
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         result = clean_json_text(content)
         if not isinstance(result, dict):
+            logger.warning(
+                "DigitalOcean AI returned invalid JSON payload; falling back. content=%s",
+                content[:1000],
+            )
             return fallback_ai_content(form_data, pricing_table, currency_code)
         return result
-    except Exception:
+    except Exception as exc:
+        logger.exception("DigitalOcean AI request exception")
         return fallback_ai_content(form_data, pricing_table, currency_code)
 
 
@@ -2113,8 +2119,16 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
 
     def iterator():
         yield sse("start", {"status": "started", "currency": currency_code})
+        yield sse(
+            "status",
+            {"message": "Structuring your form for pricing and proposal generation...", "step": "init"},
+        )
 
         yield sse("stage", {"name": "pricing", "status": "running"})
+        yield sse(
+            "status",
+            {"message": "Calculating pricing matrix...", "step": "pricing"},
+        )
         pricing_table = build_pricing_table(form_data, currency_code)
         yield sse(
             "pricing_table",
@@ -2127,15 +2141,29 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
                 "justifications": pricing_table.get("justifications", {}),
             },
         )
-        yield sse("stage", {"name": "pricing", "status": "done", "summary": pricing_table.get("summary", {})})
+        yield sse(
+            "stage",
+            {"name": "pricing", "status": "done", "summary": pricing_table.get("summary", {})},
+        )
 
         yield sse("stage", {"name": "pricing_ai", "status": "running"})
+        yield sse(
+            "status",
+            {"message": "Generating AI pricing recommendations...", "step": "pricing_ai"},
+        )
         pricing_ai_content = call_digitalocean_pricing_ai(form_data, pricing_table, currency_code)
         yield sse("stage", {"name": "pricing_ai", "status": "done", "content": pricing_ai_content})
 
         yield sse("stage", {"name": "pricing_judge", "status": "running"})
+        yield sse(
+            "status",
+            {"message": "Reviewing pricing results for quality and accuracy...", "step": "pricing_judge"},
+        )
         pricing_judge_report = call_digitalocean_pricing_judge(form_data, pricing_table, pricing_ai_content, currency_code)
-        yield sse("stage", {"name": "pricing_judge", "status": "done", "validation": pricing_judge_report})
+        yield sse(
+            "stage",
+            {"name": "pricing_judge", "status": "done", "validation": pricing_judge_report},
+        )
 
         pricing_table = apply_ai_pricing_table_rows(
             pricing_table,
@@ -2152,6 +2180,10 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
         )
 
         yield sse("stage", {"name": "proposal_ai", "status": "running"})
+        yield sse(
+            "status",
+            {"message": "AI is drafting the proposal based on your client selections...", "step": "proposal_ai"},
+        )
         proposal_ai_content = call_digitalocean_ai(form_data, pricing_table, currency_code)
         yield sse("stage", {"name": "proposal_ai", "status": "done", "content": proposal_ai_content})
 
@@ -2164,6 +2196,10 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
         ai_content = {**proposal_ai_content, **pricing_ai_merged}
 
         yield sse("stage", {"name": "judge", "status": "running"})
+        yield sse(
+            "status",
+            {"message": "Validating proposal quality and consistency...", "step": "judge"},
+        )
         judge_report = call_digitalocean_judge(form_data, pricing_table, ai_content, currency_code)
         yield sse("stage", {"name": "judge", "status": "done", "validation": judge_report})
 
@@ -2193,6 +2229,10 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
             "justification_validation": judge_report.get("justification_validation", {}),
             "summary": judge_report.get("summary", ""),
         }
+        yield sse(
+            "status",
+            {"message": "Finalizing the proposal package for delivery...", "step": "finalizing"},
+        )
         yield sse("pages", result.get("pages", []))
         yield sse("macros", result.get("macros", []))
         yield sse("result", result)
