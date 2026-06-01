@@ -12,40 +12,59 @@ The proposal content is generated with DigitalOcean AI when available.
 Pricing and page structure are built in this file only.
 """
 
+"""
+IntoAEC AI Lead Capture Form Generator — FastAPI application.
+
+Set env vars (see .env.example), then run:
+  uvicorn app:app --reload --port 8000
+
+Example:
+  curl -N -X POST http://localhost:8000/lead-capture-with-ai \\
+    -H "Content-Type: application/json" \\
+    -H "Accept: text/event-stream" \\
+    -d '{"prompt":"...","organizationDetails":"...","serviceTypes":["Architecture"],"location":{"country":"IN","city":"Chennai"}}'
+
+  Non-streaming JSON: POST .../lead-capture-with-ai/sync
+"""
+
 from __future__ import annotations
 
-import json
 import importlib.util
-import math
+import logging
 import os
-import re
-import traceback
-from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
-from typing import Any, Dict, List
 
-import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-app = FastAPI(
-    title="Lead Capture to Proposal API",
-    description="Single endpoint proposal generator",
-    version="1.0.0",
-)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="IntoAEC AI Lead Capture Form Generator", version="1.0.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "INVALID_INPUT",
+            "message": "Request validation failed",
+            "details": exc.errors(),
+        },
+    )
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, bool]:
+    return {"ok": True}
+
 
 
 def uid() -> str:
@@ -2183,8 +2202,8 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
 
 
 def load_endpoints() -> None:
-    endpoints_path = Path(__file__).parent / "proposal-via-leadcapture" / "endpoints.py"
-    spec = importlib.util.spec_from_file_location("proposal_endpoints", endpoints_path)
+    endpoints_path = Path(__file__).parent / "proposal-via-leadcapture" / "endpoint.py"
+    spec = importlib.util.spec_from_file_location("proposal_endpoint", endpoints_path)
     if not spec or not spec.loader:
         raise ImportError(f"Could not load endpoints from {endpoints_path}")
     module = importlib.util.module_from_spec(spec)
@@ -2198,4 +2217,4 @@ load_endpoints()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("API_PORT", "8000")))
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("API_PORT", "8000")), reload=False)
