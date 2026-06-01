@@ -1,43 +1,41 @@
 """
-IntoAEC AI Lead Capture Form Generator — FastAPI application.
+Pricing Table with AI FastAPI application.
 
 Set env vars (see .env.example), then run:
   uvicorn app:app --reload --port 8000
 
 Example:
-  curl -N -X POST http://localhost:8000/lead-capture-with-ai \\
+  curl -N -X POST http://localhost:8000/pricingtable-with-ai \\
     -H "Content-Type: application/json" \\
     -H "Accept: text/event-stream" \\
     -d '{"prompt":"...","organizationDetails":"...","serviceTypes":["Architecture"],"location":{"country":"IN","city":"Chennai"}}'
 
-  Non-streaming JSON: POST .../lead-capture-with-ai/sync
+  Non-streaming JSON: POST .../pricingtable-with-ai/stream
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
 import os
 import re
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List
 from uuid import uuid4
 
 import requests
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 load_dotenv()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 
-app = FastAPI(title="IntoAEC AI Lead Capture Form Generator", version="1.0.0")
+app = FastAPI(title="Pricing Table with AI", version="1.0.0")
 logger = logging.getLogger(__name__)
 
 
@@ -2241,17 +2239,69 @@ def build_proposal_stream_iterator(form_data: Dict[str, Any], currency_code: str
     return iterator
 
 
-def load_endpoints() -> None:
-    endpoints_path = Path(__file__).parent / "proposal-via-leadcapture" / "endpoint.py"
-    spec = importlib.util.spec_from_file_location("proposal_endpoint", endpoints_path)
-    if not spec or not spec.loader:
-        raise ImportError(f"Could not load endpoints from {endpoints_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.register_routes(app, parse_raw_request_body, normalize_payload, build_proposal_stream_iterator)
+def _stream_response(
+    payload: Any,
+    normalize_payload_fn,
+    build_proposal_stream_iterator_fn,
+) -> StreamingResponse:
+    form_data = normalize_payload_fn(payload)
+    currency_code = ((form_data.get("meta") or {}).get("currency") or "USD").upper()
+
+    return StreamingResponse(
+        build_proposal_stream_iterator_fn(form_data, currency_code)(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
-load_endpoints()
+def _json_input_error(exc: json.JSONDecodeError) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": "INVALID_INPUT",
+            "message": "Request body must be valid JSON.",
+            "hint": (
+                "Send either a raw JSON array of response objects or a JSON object. "
+                "Make sure there are no trailing commas, comments, or extra text around the payload."
+            ),
+            "details": str(exc),
+        },
+    )
+
+
+def _internal_error(exc: Exception) -> HTTPException:
+    logging.exception("Unhandled error while processing request")
+    return HTTPException(
+        status_code=500,
+        detail=f"Internal server error ({type(exc).__name__}): {str(exc)}",
+    )
+
+
+def register_routes(
+    app_instance,
+    parse_raw_request_body_fn,
+    normalize_payload_fn,
+    build_proposal_stream_iterator_fn,
+) -> None:
+    async def generate_pricing_table(request: Request):
+        try:
+            payload = parse_raw_request_body_fn(await request.body())
+            return _stream_response(payload, normalize_payload_fn, build_proposal_stream_iterator_fn)
+        except json.JSONDecodeError as exc:
+            raise _json_input_error(exc)
+        except Exception as exc:
+            raise _internal_error(exc)
+
+    # Keep both public paths, but route them through the same implementation.
+    app_instance.post("/pricingtable-with-ai")(generate_pricing_table)
+    app_instance.post("/pricingtable-with-ai/stream")(generate_pricing_table)
+
+
+register_routes(app, parse_raw_request_body, normalize_payload, build_proposal_stream_iterator)
 
 
 if __name__ == "__main__":
